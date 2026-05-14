@@ -28,6 +28,7 @@
 #![warn(rustdoc::broken_intra_doc_links)]
 
 mod alt_svc;
+pub mod axum_compat;
 mod error;
 mod server;
 mod zero_rtt;

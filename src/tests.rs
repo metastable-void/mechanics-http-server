@@ -12,7 +12,8 @@ use tower::util::BoxCloneService;
 use tower::{Layer, Service, ServiceExt, service_fn};
 
 use crate::{
-    Http3Server, Http3ServerConfig, alt_svc_layer, default_zero_rtt_methods, is_zero_rtt_safe,
+    Http3Server, Http3ServerConfig, alt_svc_layer, axum_compat::router_into_h3_service,
+    default_zero_rtt_methods, is_zero_rtt_safe,
 };
 
 fn test_service() -> BoxCloneService<Request<()>, Response<Bytes>, Infallible> {
@@ -88,6 +89,25 @@ async fn end_to_end_h3_request_via_mhc() {}
 async fn request_routes_into_tower_service_substitute() {
     let mut service = test_service();
     let request = Request::builder().uri("/test").body(()).unwrap();
+
+    let response = service.ready().await.unwrap().call(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body(), Bytes::from_static(b"routed"));
+}
+
+#[tokio::test]
+async fn axum_router_adapter_returns_buffered_bytes_response() {
+    let router = axum::Router::new().route(
+        "/test",
+        axum::routing::get(|| async { axum::response::Html("routed") }),
+    );
+    let mut service = router_into_h3_service(router);
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/test")
+        .body(())
+        .unwrap();
 
     let response = service.ready().await.unwrap().call(request).await.unwrap();
 
