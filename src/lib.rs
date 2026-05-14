@@ -29,11 +29,13 @@
 
 mod alt_svc;
 pub mod axum_compat;
+mod body;
 mod error;
 mod server;
 mod zero_rtt;
 
 pub use alt_svc::{AltSvcLayer, AltSvcService, alt_svc_layer};
+pub use body::{H3RequestBody, H3RequestBodyError};
 pub use error::{Error, Result};
 pub use server::{Http3Handle, Http3Server, Http3ServerConfig};
 pub use zero_rtt::{default_zero_rtt_methods, is_zero_rtt_safe};

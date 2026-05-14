@@ -7,12 +7,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http::{Request, Response, StatusCode};
+use http::{Request, Response};
+use http_body::Body;
 use quinn::crypto::rustls::QuicServerConfig;
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tower::{Service, ServiceExt};
 
+use crate::body::H3RequestBody;
 use crate::error::{Error, Result};
 use crate::zero_rtt::{default_zero_rtt_methods, is_zero_rtt_safe};
 
@@ -51,19 +53,21 @@ impl Http3Server {
 
     /// Start the HTTP/3 listener and route requests into `service`.
     ///
-    /// The service receives HTTP/3 request headers as [`Request<()>`]
-    /// and returns response headers plus a single [`Bytes`] response
-    /// body chunk.
-    pub fn start<S>(
+    /// The service receives HTTP/3 request headers plus a streaming
+    /// [`H3RequestBody`] and returns response headers plus any streaming
+    /// `http_body` response body whose data chunks are [`Bytes`].
+    pub fn start<S, RespBody>(
         self,
         service: S,
         tls_cert_chain: Vec<rustls::pki_types::CertificateDer<'static>>,
         tls_private_key: rustls::pki_types::PrivateKeyDer<'static>,
     ) -> Result<Http3Handle>
     where
-        S: Service<Request<()>, Response = Response<Bytes>> + Clone + Send + 'static,
+        S: Service<Request<H3RequestBody>, Response = Response<RespBody>> + Clone + Send + 'static,
         S::Future: Send + 'static,
         S::Error: std::fmt::Display + Send + Sync + 'static,
+        RespBody: Body<Data = Bytes> + Send + 'static,
+        RespBody::Error: std::fmt::Display + Send + Sync + 'static,
     {
         let Some(bind_addr) = self.config.bind_h3 else {
             return Ok(Http3Handle::inert());
@@ -225,16 +229,18 @@ fn quic_server_config(
     Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_config)))
 }
 
-async fn accept_loop<S>(
+async fn accept_loop<S, RespBody>(
     endpoint: quinn::Endpoint,
     mut shutdown_rx: watch::Receiver<bool>,
     service: S,
     allowed_zero_rtt_methods: Arc<Vec<http::Method>>,
 ) -> Result<()>
 where
-    S: Service<Request<()>, Response = Response<Bytes>> + Clone + Send + 'static,
+    S: Service<Request<H3RequestBody>, Response = Response<RespBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: std::fmt::Display + Send + Sync + 'static,
+    RespBody: Body<Data = Bytes> + Send + 'static,
+    RespBody::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let mut connections = JoinSet::new();
 
@@ -282,15 +288,17 @@ where
     Ok(())
 }
 
-async fn handle_connection<S>(
+async fn handle_connection<S, RespBody>(
     connecting: quinn::Connecting,
     service: S,
     allowed_zero_rtt_methods: Arc<Vec<http::Method>>,
 ) -> Result<()>
 where
-    S: Service<Request<()>, Response = Response<Bytes>> + Clone + Send + 'static,
+    S: Service<Request<H3RequestBody>, Response = Response<RespBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
     S::Error: std::fmt::Display + Send + Sync + 'static,
+    RespBody: Body<Data = Bytes> + Send + 'static,
+    RespBody::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let connection = connecting
         .await
@@ -334,20 +342,23 @@ where
     Ok(())
 }
 
-async fn handle_request<S>(
+async fn handle_request<S, RespBody>(
     resolver: h3::server::RequestResolver<h3_quinn::Connection, Bytes>,
     mut service: S,
     allowed_zero_rtt_methods: &[http::Method],
 ) -> Result<()>
 where
-    S: Service<Request<()>, Response = Response<Bytes>> + Send + 'static,
+    S: Service<Request<H3RequestBody>, Response = Response<RespBody>> + Send + 'static,
     S::Future: Send + 'static,
     S::Error: std::fmt::Display + Send + Sync + 'static,
+    RespBody: Body<Data = Bytes> + Send + 'static,
+    RespBody::Error: std::fmt::Display + Send + Sync + 'static,
 {
-    let (request, mut stream) = resolver
+    let (request, stream) = resolver
         .resolve_request()
         .await
         .map_err(|e| Error::Internal(format!("HTTP/3 request resolution failed: {e}")))?;
+    let (mut send_stream, recv_stream) = stream.split();
 
     if !is_zero_rtt_safe(request.method(), allowed_zero_rtt_methods) {
         tracing::trace!(
@@ -356,35 +367,60 @@ where
         );
     }
 
-    let response = match service.ready().await {
-        Ok(ready) => ready
-            .call(request)
-            .await
-            .map_err(|e| Error::Internal(format!("HTTP/3 service failed: {e}")))?,
-        Err(e) => {
-            tracing::warn!("HTTP/3 service was not ready: {e}");
-            Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(Bytes::new())
-                .map_err(|e| Error::Internal(format!("service-unavailable response failed: {e}")))?
-        }
-    };
+    let (parts, ()) = request.into_parts();
+    let request = Request::from_parts(parts, H3RequestBody::new(recv_stream));
+    let response = service
+        .ready()
+        .await
+        .map_err(|e| Error::Internal(format!("HTTP/3 service was not ready: {e}")))?
+        .call(request)
+        .await
+        .map_err(|e| Error::Internal(format!("HTTP/3 service failed: {e}")))?;
 
     let (parts, body) = response.into_parts();
-    stream
+    send_stream
         .send_response(Response::from_parts(parts, ()))
         .await
         .map_err(|e| Error::Internal(format!("HTTP/3 response headers failed: {e}")))?;
-    if !body.is_empty() {
-        stream
-            .send_data(body)
-            .await
-            .map_err(|e| Error::Internal(format!("HTTP/3 response body failed: {e}")))?;
-    }
-    stream
+    send_response_body(&mut send_stream, body).await?;
+    send_stream
         .finish()
         .await
         .map_err(|e| Error::Internal(format!("HTTP/3 response finish failed: {e}")))?;
+
+    Ok(())
+}
+
+async fn send_response_body<RespBody>(
+    stream: &mut h3::server::RequestStream<h3_quinn::SendStream<Bytes>, Bytes>,
+    body: RespBody,
+) -> Result<()>
+where
+    RespBody: Body<Data = Bytes> + Send + 'static,
+    RespBody::Error: std::fmt::Display + Send + Sync + 'static,
+{
+    let mut body = std::pin::pin!(body);
+    while let Some(frame) = std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)).await {
+        let frame =
+            frame.map_err(|e| Error::Internal(format!("HTTP/3 response body failed: {e}")))?;
+        match frame.into_data() {
+            Ok(bytes) => {
+                if !bytes.is_empty() {
+                    stream.send_data(bytes).await.map_err(|e| {
+                        Error::Internal(format!("HTTP/3 response body failed: {e}"))
+                    })?;
+                }
+            }
+            Err(frame) => {
+                let trailers = frame.into_trailers().map_err(|_| {
+                    Error::Internal("HTTP/3 response body yielded an unknown frame".to_owned())
+                })?;
+                stream.send_trailers(trailers).await.map_err(|e| {
+                    Error::Internal(format!("HTTP/3 response trailers failed: {e}"))
+                })?;
+            }
+        }
+    }
 
     Ok(())
 }
