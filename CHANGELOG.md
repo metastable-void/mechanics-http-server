@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-05-15
+
+### Fixed
+- QUIC server transport config now sets
+  `keep_alive_interval = 15s` and `max_idle_timeout = 120s`.
+  Without these, idle h3 connections silently die at
+  NAT / stateful-firewall eviction (typically 30-60s on
+  consumer-grade infra, longer on cloud), and the next
+  request on a cached client-side h3 connection surfaces as
+  a stream-level cancel with no useful detail. Server-side
+  keep-alives ensure the connection's liveness probes find
+  a willing peer; the matching `mhc 0.2.4` client-side
+  setting drives the heartbeats. The 15s interval is well
+  under typical NAT-state TTLs; the 120s max-idle keeps
+  truly-idle connections from sitting in the pool forever.
+
 ## [0.1.3] - 2026-05-14
 
 ### Added

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, Response};
@@ -17,6 +18,9 @@ use tower::{Service, ServiceExt};
 use crate::body::H3RequestBody;
 use crate::error::{Error, Result};
 use crate::zero_rtt::{default_zero_rtt_methods, is_zero_rtt_safe};
+
+const H3_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const H3_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Optional HTTP/3 listener that runs alongside an existing TCP+TLS server.
 #[derive(Clone, Debug)]
@@ -226,7 +230,19 @@ fn quic_server_config(
 
     let quic_config =
         QuicServerConfig::try_from(tls_config).map_err(|e| Error::InvalidTls(e.to_string()))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_config)))
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_config));
+    server_config.transport_config(Arc::new(h3_transport_config()?));
+    Ok(server_config)
+}
+
+fn h3_transport_config() -> Result<quinn::TransportConfig> {
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .keep_alive_interval(Some(H3_KEEP_ALIVE_INTERVAL))
+        .max_idle_timeout(Some(H3_MAX_IDLE_TIMEOUT.try_into().map_err(|e| {
+            Error::InvalidTls(format!("invalid HTTP/3 idle timeout: {e}"))
+        })?));
+    Ok(transport)
 }
 
 async fn accept_loop<S, RespBody>(
