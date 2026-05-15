@@ -6,15 +6,11 @@ use std::task::{Context, Poll};
 
 use bytes::{Buf, Bytes};
 use h3::server::RequestStream;
-use http::HeaderMap;
 use http_body::Frame;
 
 type H3RecvStream = RequestStream<h3_quinn::RecvStream, Bytes>;
 type RecvDataFuture =
     Pin<Box<dyn Future<Output = (H3RecvStream, Result<Option<Bytes>, H3RequestBodyError>)> + Send>>;
-type RecvTrailersFuture = Pin<
-    Box<dyn Future<Output = (H3RecvStream, Result<Option<HeaderMap>, H3RequestBodyError>)> + Send>,
->;
 
 /// Streaming request body received from an HTTP/3 client.
 ///
@@ -29,8 +25,6 @@ pub struct H3RequestBody {
 enum H3RequestBodyState {
     ReadingData,
     DataFuture(RecvDataFuture),
-    ReadingTrailers,
-    TrailersFuture(RecvTrailersFuture),
     Done,
 }
 
@@ -57,8 +51,7 @@ impl std::fmt::Debug for H3RequestBody {
 /// Error returned while receiving an HTTP/3 request body.
 #[derive(Debug, thiserror::Error)]
 pub enum H3RequestBodyError {
-    /// The underlying HTTP/3 stream returned an error while receiving
-    /// data or trailers.
+    /// The underlying HTTP/3 stream returned an error while receiving data.
     #[error("HTTP/3 request body failed: {0}")]
     Stream(String),
 }
@@ -107,39 +100,14 @@ impl http_body::Body for H3RequestBody {
                             return Poll::Ready(Some(Ok(Frame::data(bytes))));
                         }
                         Ok(None) => {
-                            self.state = H3RequestBodyState::ReadingTrailers;
+                            self.state = H3RequestBodyState::Done;
+                            return Poll::Ready(None);
                         }
                         Err(error) => {
                             self.state = H3RequestBodyState::Done;
                             return Poll::Ready(Some(Err(error)));
                         }
                     }
-                }
-                H3RequestBodyState::ReadingTrailers => {
-                    let Some(mut stream) = self.stream.take() else {
-                        self.state = H3RequestBodyState::Done;
-                        return Poll::Ready(None);
-                    };
-                    self.state = H3RequestBodyState::TrailersFuture(Box::pin(async move {
-                        let result = stream
-                            .recv_trailers()
-                            .await
-                            .map_err(H3RequestBodyError::stream);
-                        (stream, result)
-                    }));
-                }
-                H3RequestBodyState::TrailersFuture(future) => {
-                    let (stream, result) = match future.as_mut().poll(cx) {
-                        Poll::Pending => return Poll::Pending,
-                        Poll::Ready(result) => result,
-                    };
-                    self.stream = Some(stream);
-                    self.state = H3RequestBodyState::Done;
-                    return Poll::Ready(match result {
-                        Ok(Some(trailers)) => Some(Ok(Frame::trailers(trailers))),
-                        Ok(None) => None,
-                        Err(error) => Some(Err(error)),
-                    });
                 }
                 H3RequestBodyState::Done => return Poll::Ready(None),
             }

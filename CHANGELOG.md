@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.4] - 2026-05-15
 
 ### Fixed
+- `H3RequestBody` now treats DATA EOF as request-body
+  completion and does not wait for optional trailers. The
+  prior `recv_trailers().await` path kept the body future
+  open after the final DATA frame so trailer-aware
+  consumers could observe trailers; in practice, none of the
+  workspace's services (connector-router, connector-service,
+  api-server forwarder) consume request trailers, and an h3
+  stack that does not resolve the "no trailers" phase
+  promptly was holding complete POST bodies open
+  indefinitely — exactly the pattern observed for
+  `endpoint("llm")` POST calls reaching H3 then timing out
+  at the mechanics 300 s outer timeout without ever reaching
+  the upstream connector-service dial. The `ReadingTrailers`
+  / `TrailersFuture` states and the `RecvTrailersFuture`
+  alias are removed; the public `H3RequestBody` /
+  `H3RequestBodyError` API surface is unchanged.
 - QUIC server transport config now sets
   `keep_alive_interval = 15s` and `max_idle_timeout = 120s`.
   Without these, idle h3 connections silently die at
@@ -17,9 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a stream-level cancel with no useful detail. Server-side
   keep-alives ensure the connection's liveness probes find
   a willing peer; the matching `mhc 0.2.4` client-side
-  setting drives the heartbeats. The 15s interval is well
-  under typical NAT-state TTLs; the 120s max-idle keeps
-  truly-idle connections from sitting in the pool forever.
+  setting drives the heartbeats. (Note: mhc 0.2.4 dropped
+  its per-origin H3 sender cache, so client-side reuse
+  across requests is no longer the dominant case;
+  keep-alives now matter mostly for streaming responses
+  that span the 30–60 s NAT-state TTL window.)
 
 ## [0.1.3] - 2026-05-14
 
