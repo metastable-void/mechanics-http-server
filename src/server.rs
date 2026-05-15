@@ -326,25 +326,28 @@ where
     let mut streams = JoinSet::new();
 
     loop {
-        match h3_conn.accept().await {
-            Ok(Some(resolver)) => {
-                let stream_service = service.clone();
-                let stream_allowed = allowed_zero_rtt_methods.clone();
-                streams.spawn(async move {
-                    if let Err(e) =
-                        handle_request(resolver, stream_service, stream_allowed.as_slice()).await
-                    {
-                        tracing::warn!("HTTP/3 request failed: {e}");
+        tokio::select! {
+            accepted = h3_conn.accept() => {
+                match accepted {
+                    Ok(Some(resolver)) => {
+                        let stream_service = service.clone();
+                        let stream_allowed = allowed_zero_rtt_methods.clone();
+                        streams.spawn(async move {
+                            if let Err(e) =
+                                handle_request(resolver, stream_service, stream_allowed.as_slice()).await
+                            {
+                                tracing::warn!("HTTP/3 request failed: {e}");
+                            }
+                        });
                     }
-                });
+                    Ok(None) => break,
+                    Err(e) => return Err(Error::Internal(format!("HTTP/3 accept failed: {e}"))),
+                }
             }
-            Ok(None) => break,
-            Err(e) => return Err(Error::Internal(format!("HTTP/3 accept failed: {e}"))),
-        }
-
-        while let Some(joined) = streams.try_join_next() {
-            if let Err(e) = joined {
-                tracing::warn!("HTTP/3 request task failed: {e}");
+            joined = streams.join_next(), if !streams.is_empty() => {
+                if let Some(Err(e)) = joined {
+                    tracing::warn!("HTTP/3 request task failed: {e}");
+                }
             }
         }
     }

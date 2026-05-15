@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.1.4] - 2026-05-15
 
 ### Fixed
+- The H3 server accept loop now uses `tokio::select!` to
+  drive `h3_conn.accept()` and `streams.join_next()`
+  concurrently. Previously the loop awaited `accept()`
+  sequentially and only joined finished request tasks via
+  `streams.try_join_next()` between accept calls, so a
+  long stretch with no new connections could let the
+  `JoinSet` accumulate completed-but-unjoined tasks (their
+  error logs only firing when the next connection arrived).
+  With `select!` the JoinSet drains finished tasks as they
+  complete, in parallel with awaiting the next accept,
+  matching how the rest of the workspace's accept loops are
+  structured.
 - `H3RequestBody` now treats DATA EOF as request-body
   completion and does not wait for optional trailers. The
   prior `recv_trailers().await` path kept the body future
