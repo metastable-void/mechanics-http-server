@@ -274,9 +274,13 @@ where
                 let Some(incoming) = incoming else {
                     break;
                 };
-                let connecting = incoming
-                    .accept()
-                    .map_err(|e| Error::Internal(format!("incoming connection rejected: {e}")))?;
+                let connecting = match incoming.accept() {
+                    Ok(connecting) => connecting,
+                    Err(error) => {
+                        tracing::warn!("HTTP/3 incoming connection rejected: {error}");
+                        continue;
+                    }
+                };
                 let connection_service = service.clone();
                 let connection_allowed = allowed_zero_rtt_methods.clone();
                 connections.spawn(async move {

@@ -91,6 +91,33 @@ async fn start_with_bind_opens_listener() {
 }
 
 #[tokio::test]
+async fn incompatible_quic_handshake_does_not_stop_listener() {
+    let (cert_chain, key) = test_tls_material();
+    let server = Http3Server::new(Http3ServerConfig {
+        bind_h3: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
+        ..Http3ServerConfig::default()
+    });
+    let handle = server
+        .start(test_service(), cert_chain.clone(), key)
+        .unwrap();
+    let local_addr = handle.local_addr().unwrap();
+
+    attempt_incompatible_quic_connection(local_addr, cert_chain[0].clone()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!handle.is_finished());
+
+    let mut client = H3TestClient::connect(local_addr, cert_chain[0].clone()).await;
+    let (body, _, _) = client.request_with_body(Method::GET, "/test", &[]).await;
+    assert_eq!(body, b"routed");
+
+    handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 #[ignore = "D22 server round 02 fixture work: mechanics-http-client does not expose a self-signed test trust hook"]
 async fn end_to_end_h3_request_via_mhc() {}
 
@@ -403,6 +430,25 @@ impl H3TestClient {
 
         (response_body, request_frames_sent, response_frames_received)
     }
+}
+
+async fn attempt_incompatible_quic_connection(addr: SocketAddr, cert: CertificateDer<'static>) {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert).unwrap();
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"not-h3".to_vec()];
+    let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config).unwrap();
+    let client_config = quinn::ClientConfig::new(Arc::new(quic_config));
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).unwrap();
+    endpoint.set_default_client_config(client_config);
+
+    let connection = endpoint.connect(addr, "localhost").unwrap().await;
+    assert!(connection.is_err());
 }
 
 fn randomish_bytes(len: usize) -> Vec<u8> {

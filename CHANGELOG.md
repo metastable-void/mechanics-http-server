@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Rejected incoming QUIC handshakes are now logged as per-
+  connection HTTP/3 warnings instead of terminating the
+  listener accept loop. Incompatible scanners or clients should
+  no longer stop the whole H3 sidecar.
+
 ## [0.1.4] - 2026-05-15
 
 ### Fixed
